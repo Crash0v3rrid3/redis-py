@@ -1,15 +1,17 @@
-from distutils.version import StrictVersion
-from itertools import chain
-from time import time
-from queue import LifoQueue, Empty, Full
-from urllib.parse import parse_qs, unquote, urlparse
 import errno
 import io
 import os
 import socket
 import threading
 import warnings
+from distutils.version import StrictVersion
+from functools import partial
+from itertools import chain
+from queue import LifoQueue, Empty, Full
+from time import time
+from urllib.parse import parse_qs, unquote, urlparse
 
+from async_executor import loop, run_async_job, complete_async_jobs
 from redis.exceptions import (
     AuthenticationError,
     AuthenticationWrongNumberOfArgsError,
@@ -31,6 +33,7 @@ from redis.utils import HIREDIS_AVAILABLE, str_if_bytes
 
 try:
     import ssl
+
     ssl_available = True
 except ImportError:
     ssl_available = False
@@ -191,7 +194,7 @@ class SocketBuffer:
             if custom_timeout:
                 sock.settimeout(timeout)
             while True:
-                data = self._sock.recv(socket_read_size)
+                data = run_async_job(loop.sock_recv(socket_read_size)).result()
                 # an empty string indicates the server shutdown the socket
                 if isinstance(data, bytes) and len(data) == 0:
                     raise ConnectionError(SERVER_CLOSED_CONNECTION_ERROR)
@@ -223,8 +226,8 @@ class SocketBuffer:
 
     def can_read(self, timeout):
         return bool(self.length) or \
-            self._read_from_socket(timeout=timeout,
-                                   raise_on_timeout=False)
+               self._read_from_socket(timeout=timeout,
+                                      raise_on_timeout=False)
 
     def read(self, length):
         length = length + 2  # make sure to read the \r\n terminator
@@ -285,6 +288,7 @@ class SocketBuffer:
 
 class PythonParser(BaseParser):
     "Plain Python parsing class"
+
     def __init__(self, socket_read_size):
         self.socket_read_size = socket_read_size
         self.encoder = None
@@ -364,6 +368,7 @@ class PythonParser(BaseParser):
 
 class HiredisParser(BaseParser):
     "Parser class for connections using Hiredis"
+
     def __init__(self, socket_read_size):
         if not HIREDIS_AVAILABLE:
             raise RedisError("Hiredis is not installed")
@@ -420,12 +425,12 @@ class HiredisParser(BaseParser):
             if custom_timeout:
                 sock.settimeout(timeout)
             if HIREDIS_USE_BYTE_BUFFER:
-                bufflen = self._sock.recv_into(self._buffer)
+                bufflen = run_async_job(loop.recv_into(self._buffer)).result()
                 if bufflen == 0:
                     raise ConnectionError(SERVER_CLOSED_CONNECTION_ERROR)
                 self._reader.feed(self._buffer, 0, bufflen)
             else:
-                buffer = self._sock.recv(self.socket_read_size)
+                buffer = run_async_job(loop.recv(self.socket_read_size)).result()
                 # an empty string indicates the server shutdown the socket
                 if not isinstance(buffer, bytes) or len(buffer) == 0:
                     raise ConnectionError(SERVER_CLOSED_CONNECTION_ERROR)
@@ -577,8 +582,8 @@ class Connection:
         # ipv4/ipv6, but we want to set options prior to calling
         # socket.connect()
         err = None
-        for res in socket.getaddrinfo(self.host, self.port, self.socket_type,
-                                      socket.SOCK_STREAM):
+        for res in run_async_job(loop.getaddrinfo(self.host, self.port, self.socket_type,
+                                                 socket.SOCK_STREAM)):
             family, socktype, proto, canonname, socket_address = res
             sock = None
             try:
@@ -596,7 +601,7 @@ class Connection:
                 sock.settimeout(self.socket_connect_timeout)
 
                 # connect
-                sock.connect(socket_address)
+                run_async_job(loop.sock_connect(sock, socket_address)).result()
 
                 # set the socket_timeout now that we're connected
                 sock.settimeout(self.socket_timeout)
@@ -616,10 +621,10 @@ class Connection:
         # or just "message"
         if len(exception.args) == 1:
             return "Error connecting to %s:%s. %s." % \
-                (self.host, self.port, exception.args[0])
+                   (self.host, self.port, exception.args[0])
         else:
             return "Error %s connecting to %s:%s. %s." % \
-                (exception.args[0], self.host, self.port, exception.args[1])
+                   (exception.args[0], self.host, self.port, exception.args[1])
 
     def on_connect(self):
         "Initialize the connection, authenticate and select a database"
@@ -698,8 +703,7 @@ class Connection:
         try:
             if isinstance(command, str):
                 command = [command]
-            for item in command:
-                self._sock.sendall(item)
+            complete_async_jobs(*map(partial(loop.sendall, self._sock), command))
         except socket.timeout:
             self.disconnect()
             raise TimeoutError("Timeout writing to socket")
@@ -901,10 +905,10 @@ class UnixDomainSocketConnection(Connection):
         # or just "message"
         if len(exception.args) == 1:
             return "Error connecting to unix socket: %s. %s." % \
-                (self.path, exception.args[0])
+                   (self.path, exception.args[0])
         else:
             return "Error %s connecting to unix socket: %s. %s." % \
-                (exception.args[0], self.path, exception.args[1])
+                   (exception.args[0], self.path, exception.args[1])
 
 
 FALSE_STRINGS = ('0', 'F', 'FALSE', 'N', 'NO')
@@ -996,6 +1000,7 @@ class ConnectionPool:
     Any additional keyword arguments are passed to the constructor of
     ``connection_class``.
     """
+
     @classmethod
     def from_url(cls, url, **kwargs):
         """
@@ -1257,6 +1262,7 @@ class BlockingConnectionPool(ConnectionPool):
         >>> # not available.
         >>> pool = BlockingConnectionPool(timeout=5)
     """
+
     def __init__(self, max_connections=50, timeout=20,
                  connection_class=Connection, queue_class=LifoQueue,
                  **connection_kwargs):
